@@ -1,1 +1,237 @@
-print("hello")
+import requests
+from bs4 import BeautifulSoup
+import csv
+from urllib.parse import urljoin, urlparse, urlencode, parse_qs
+
+BASE_URL = "https://twothirds.com"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.7,en;q=0.5",
+}
+
+# -------------------------------------------------------------
+# 1) Charger une page HTML
+# -------------------------------------------------------------
+def get_soup(url: str) -> BeautifulSoup:
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser")
+
+
+# -------------------------------------------------------------
+# 2) Construire une URL de collection pour une page donnée (?page=N)
+# -------------------------------------------------------------
+def build_collection_page_url(base_url: str, page: int) -> str:
+    parsed = urlparse(base_url)
+    query = parse_qs(parsed.query)
+
+    query["page"] = [str(page)]
+    new_query = urlencode(query, doseq=True)
+
+    return parsed._replace(query=new_query).geturl()
+
+
+# -------------------------------------------------------------
+# 3) Liens produits sur UNE page de collection
+# -------------------------------------------------------------
+def extract_product_links_from_single_page(collection_page_url: str) -> list[str]:
+    soup = get_soup(collection_page_url)
+    links = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/collections/" in href and "/products/" in href:
+            full_url = urljoin(BASE_URL, href)
+            links.add(full_url)
+
+    return sorted(links)
+
+
+# -------------------------------------------------------------
+# 4) Liens produits sur TOUTES les pages d'une collection
+# -------------------------------------------------------------
+def extract_product_links_from_collection(
+    collection_url: str,
+    max_pages: int | None = None,
+    max_products: int | None = None,
+) -> list[str]:
+
+    all_links = []
+    seen = set()
+    page = 1
+
+    while True:
+        if max_pages is not None and page > max_pages:
+            break
+
+        page_url = build_collection_page_url(collection_url, page)
+        print(f"→ Page {page} : {page_url}")
+
+        links = extract_product_links_from_single_page(page_url)
+        print(f"   {len(links)} produits trouvés sur cette page")
+
+        if not links:
+            # plus de produits -> on arrête la pagination
+            break
+
+        new_links = [url for url in links if url not in seen]
+        seen.update(new_links)
+        all_links.extend(new_links)
+
+        if max_products is not None and len(all_links) >= max_products:
+            all_links = all_links[:max_products]
+            break
+
+        page += 1
+
+    print(f"Total produits uniques pour cette collection : {len(all_links)}")
+    return all_links
+
+
+# -------------------------------------------------------------
+# 5) Scraper une page produit TWOTHIRDS
+#    -> name, price, product_category_slug, details
+# -------------------------------------------------------------
+def scrape_twothirds_product(url: str) -> dict:
+    soup = get_soup(url)
+
+    # ----- Nom produit -----
+    name_tag = soup.find("h1")
+    name = name_tag.get_text(strip=True) if name_tag else "N/A"
+
+    # ----- Prix -----
+    price = None
+    for t in soup.find_all(string=True):
+        txt = t.strip()
+        if txt.startswith("€") and any(ch.isdigit() for ch in txt):
+            price = txt
+            break
+    if price is None:
+        price = "N/A"
+
+    # ----- Catégorie de produit depuis l'URL (slug ex: t-shirts-men, knits-men) -----
+    parsed = urlparse(url)
+    segments = parsed.path.strip("/").split("/")  # ['collections','t-shirts-men','products','...']
+
+    product_category_slug = "N/A"
+    if "collections" in segments and "products" in segments:
+        idx_coll = segments.index("collections")
+        idx_prod = segments.index("products")
+        if idx_coll + 1 < idx_prod:
+            product_category_slug = segments[idx_coll + 1]
+
+    # ----- Bloc de description principal -----
+    def has_details_class(tag):
+        classes = tag.get("class", [])
+        return tag.name in {"div", "section"} and "HighlightSol--buildingBlock" in classes
+
+    block = soup.find(has_details_class)
+    details = ""
+
+    if block:
+        paragraphs = [p.get_text(" ", strip=True) for p in block.find_all("p")]
+        list_items = [li.get_text(" ", strip=True) for li in block.find_all("li")]
+
+        model_note = None
+        em = block.find("em")
+        if em:
+            model_note = em.get_text(" ", strip=True)
+
+        parts = paragraphs + list_items
+        if model_note:
+            parts.append(model_note)
+
+        details = " ".join(parts).strip()
+
+    # ----- Fallback si description vide : section "Details" -> avant "Delivery" -----
+    if not details:
+        details_heading = soup.find(
+            string=lambda t: isinstance(t, str) and t.strip() == "Details"
+        )
+        if details_heading:
+            parent = details_heading.find_parent()
+            texts = []
+            for sib in parent.next_siblings:
+                if getattr(sib, "get_text", None):
+                    t = sib.get_text(" ", strip=True)
+                    if t.startswith("Delivery"):
+                        break
+                    if t:
+                        texts.append(t)
+            details = " ".join(texts).strip()
+
+    if not details:
+        print(f"⚠️ Aucune description trouvée pour : {url}")
+
+    return {
+        "name": name,
+        "price": price,
+        "product_category_slug": product_category_slug,
+        "details": details,
+    }
+
+
+# -------------------------------------------------------------
+# 6) Scraper PLUSIEURS collections et tout mettre dans UN CSV
+# -------------------------------------------------------------
+def scrape_multiple_collections_to_csv(
+    collection_urls: list[str],
+    csv_filename: str,
+    max_products_per_collection: int | None = None,
+    max_pages_per_collection: int | None = None,
+):
+    rows = []
+
+    for coll_url in collection_urls:
+        print(f"\n=== Collection : {coll_url} ===")
+        product_urls = extract_product_links_from_collection(
+            coll_url,
+            max_pages=max_pages_per_collection,
+            max_products=max_products_per_collection,
+        )
+
+        for url in product_urls:
+            print(f"Scraping produit : {url}")
+            try:
+                data = scrape_twothirds_product(url)
+                rows.append(data)
+            except Exception as e:
+                print(f"Erreur sur {url} : {e}")
+
+    fieldnames = ["name", "price", "product_category_slug", "details"]
+
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nCSV créé : {csv_filename} — {len(rows)} produits enregistrés.")
+
+
+# -------------------------------------------------------------
+# 7) MAIN
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    MEN_COLLECTION_URLS = [
+        "https://twothirds.com/collections/t-shirts-men",     # T-Shirts
+        "https://twothirds.com/collections/trousers-men",     # Pants
+        "https://twothirds.com/collections/knits-men",        # Knits
+        "https://twothirds.com/collections/jackets-men",      # Jackets
+        "https://twothirds.com/collections/shirts-men",       # Shirts
+        "https://twothirds.com/collections/sweatshirts-men",  # Sweatshirts
+        "https://twothirds.com/collections/men-underwear",    # Underwear
+    ]
+
+    CSV_FILENAME = "twothirds_men_7categories.csv"
+
+    scrape_multiple_collections_to_csv(
+        MEN_COLLECTION_URLS,
+        CSV_FILENAME,
+        max_products_per_collection=None,   # limite par collection (None = tout)
+        max_pages_per_collection=None,      # limite de pages (None = tant qu'il y a des produits)
+    )
