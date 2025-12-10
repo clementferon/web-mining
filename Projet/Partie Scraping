@@ -54,6 +54,8 @@ def extract_product_links_from_single_page(collection_page_url: str) -> list[str
 
 # -------------------------------------------------------------
 # 4) Liens produits sur TOUTES les pages d'une collection
+#    max_pages: limite de pages
+#    max_products: limite de produits
 # -------------------------------------------------------------
 def extract_product_links_from_collection(
     collection_url: str,
@@ -95,9 +97,9 @@ def extract_product_links_from_collection(
 
 # -------------------------------------------------------------
 # 5) Scraper une page produit TWOTHIRDS
-#    -> name, price, product_category_slug, details
+#    -> name, price, product_category_slug, gender, details
 # -------------------------------------------------------------
-def scrape_twothirds_product(url: str) -> dict:
+def scrape_twothirds_product(url: str, gender: str) -> dict:
     soup = get_soup(url)
 
     # ----- Nom produit -----
@@ -114,7 +116,7 @@ def scrape_twothirds_product(url: str) -> dict:
     if price is None:
         price = "N/A"
 
-    # ----- Catégorie de produit depuis l'URL (slug ex: t-shirts-men, knits-men) -----
+    # ----- Catégorie de produit depuis l'URL (slug entre /collections/ et /products/)
     parsed = urlparse(url)
     segments = parsed.path.strip("/").split("/")  # ['collections','t-shirts-men','products','...']
 
@@ -172,23 +174,25 @@ def scrape_twothirds_product(url: str) -> dict:
         "name": name,
         "price": price,
         "product_category_slug": product_category_slug,
+        "gender": gender,
         "details": details,
     }
 
 
 # -------------------------------------------------------------
-# 6) Scraper PLUSIEURS collections et tout mettre dans UN CSV
+# 6) Scraper toutes les collections d'un genre (Men / Women)
+#    et renvoyer une liste de lignes (dict)
 # -------------------------------------------------------------
-def scrape_multiple_collections_to_csv(
+def scrape_gender_collections(
+    gender: str,
     collection_urls: list[str],
-    csv_filename: str,
     max_products_per_collection: int | None = None,
     max_pages_per_collection: int | None = None,
-):
+) -> list[dict]:
     rows = []
 
     for coll_url in collection_urls:
-        print(f"\n=== Collection : {coll_url} ===")
+        print(f"\n=== {gender} – Collection : {coll_url} ===")
         product_urls = extract_product_links_from_collection(
             coll_url,
             max_pages=max_pages_per_collection,
@@ -198,23 +202,16 @@ def scrape_multiple_collections_to_csv(
         for url in product_urls:
             print(f"Scraping produit : {url}")
             try:
-                data = scrape_twothirds_product(url)
+                data = scrape_twothirds_product(url, gender=gender)
                 rows.append(data)
             except Exception as e:
                 print(f"Erreur sur {url} : {e}")
 
-    fieldnames = ["name", "price", "product_category_slug", "details"]
-
-    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"\nCSV créé : {csv_filename} — {len(rows)} produits enregistrés.")
+    return rows
 
 
 # -------------------------------------------------------------
-# 7) MAIN
+# 7) MAIN : Men + Women → un seul CSV
 # -------------------------------------------------------------
 if __name__ == "__main__":
     MEN_COLLECTION_URLS = [
@@ -227,11 +224,49 @@ if __name__ == "__main__":
         "https://twothirds.com/collections/men-underwear",    # Underwear
     ]
 
-    CSV_FILENAME = "twothirds_men_7categories.csv"
+    WOMEN_COLLECTION_URLS = [
+        "https://twothirds.com/collections/tops",             # Tops
+        "https://twothirds.com/collections/shirts-women",     # Shirts
+        "https://twothirds.com/collections/trousers-women",   # Pants
+        "https://twothirds.com/collections/sweatshirts-women",# Sweatshirts
+        "https://twothirds.com/collections/knits-women",      # Knits
+        "https://twothirds.com/collections/jackets-women",    # Jackets
+        "https://twothirds.com/collections/skirts",           # Skirts
+        "https://twothirds.com/collections/women-loungewear", # Loungewear
+        "https://twothirds.com/collections/underwear",        # Underwear
+        "https://twothirds.com/collections/women-activewear", # Activewear
+        "https://twothirds.com/collections/swimwear-women",   # Swimwear
+    ]
 
-    scrape_multiple_collections_to_csv(
+    CSV_FILENAME = "twothirds_men_women_allcategories.csv"
+
+    # Paramètres de contrôle :
+    #   max_products_per_collection=None -> tous les produits
+    #   max_pages_per_collection=None    -> toutes les pages de chaque collection
+    max_products_per_collection = None
+    max_pages_per_collection = None
+
+    rows_men = scrape_gender_collections(
+        "Men",
         MEN_COLLECTION_URLS,
-        CSV_FILENAME,
-        max_products_per_collection=None,   # limite par collection (None = tout)
-        max_pages_per_collection=None,      # limite de pages (None = tant qu'il y a des produits)
+        max_products_per_collection=max_products_per_collection,
+        max_pages_per_collection=max_pages_per_collection,
     )
+
+    rows_women = scrape_gender_collections(
+        "Women",
+        WOMEN_COLLECTION_URLS,
+        max_products_per_collection=max_products_per_collection,
+        max_pages_per_collection=max_pages_per_collection,
+    )
+
+    all_rows = rows_men + rows_women
+
+    fieldnames = ["name", "price", "product_category_slug", "gender", "details"]
+
+    with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"\nCSV créé : {CSV_FILENAME} — {len(all_rows)} produits enregistrés.")
