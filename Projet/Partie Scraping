@@ -2,8 +2,23 @@ import requests
 from bs4 import BeautifulSoup
 import csv
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs
+import time
+import re
 
-BASE_URL = "https://twothirds.com"
+# ==============================================================================
+# ⚙️ CONFIGURATION UTILISATEUR
+# ==============================================================================
+# Change l'URL ici pour tester sur un autre site (ex: "https://shop.mango.com" ou autre Shopify)
+BASE_URL = "https://en.nikinclothing.com" 
+
+# Limites (Mettre None pour illimité) 
+MAX_PRODUCTS_PER_CATEGORY = 10  # Combien de produits max par collection ?
+MAX_PAGES_TO_SCAN = 3           # Combien de pages de pagination max explorer ?
+
+# Nom du fichier de sortie
+OUTPUT_CSV = "resultats_scraping_universel.csv"
+
+# ==============================================================================
 
 HEADERS = {
     "User-Agent": (
@@ -14,259 +29,234 @@ HEADERS = {
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.7,en;q=0.5",
 }
 
-# -------------------------------------------------------------
-# 1) Charger une page HTML
-# -------------------------------------------------------------
-def get_soup(url: str) -> BeautifulSoup:
-    resp = requests.get(url, headers=HEADERS)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
-
-
-# -------------------------------------------------------------
-# 2) Construire une URL de collection pour une page donnée (?page=N)
-# -------------------------------------------------------------
-def build_collection_page_url(base_url: str, page: int) -> str:
-    parsed = urlparse(base_url)
-    query = parse_qs(parsed.query)
-
-    query["page"] = [str(page)]
-    new_query = urlencode(query, doseq=True)
-
-    return parsed._replace(query=new_query).geturl()
-
+def get_soup(url: str):
+    """Récupère le HTML d'une page avec gestion d'erreur."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        return BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        print(f"❌ Erreur connexion {url}: {e}")
+        return None
 
 # -------------------------------------------------------------
-# 3) Liens produits sur UNE page de collection
+# 1) Découverte générique des collections
 # -------------------------------------------------------------
-def extract_product_links_from_single_page(collection_page_url: str) -> list[str]:
-    soup = get_soup(collection_page_url)
-    links = set()
+def discover_collections(base_url: str) -> dict:
+    """
+    Scanne la page d'accueil pour trouver des collections.
+    Essaie de deviner si c'est Homme ou Femme via l'URL.
+    """
+    print(f"🔍 Scan du site : {base_url} ...")
+    soup = get_soup(base_url)
+    if not soup:
+        return {}
+
+    collections = {"Men": set(), "Women": set(), "Uncategorized": set()}
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/collections/" in href and "/products/" in href:
-            full_url = urljoin(BASE_URL, href)
-            links.add(full_url)
+        # Pattern typique Shopify : /collections/mais-pas-products
+        if "/collections/" in href and "/products/" not in href:
+            full_url = urljoin(base_url, href)
+            
+            # Filtres anti-bruit (cartes cadeaux, nouveautés, etc.)
+            ignored_keywords = ["all", "new-in", "sale", "gift", "last-chance", "bestsellers"]
+            if any(k in href.lower() for k in ignored_keywords):
+                continue
 
-    return sorted(links)
-
-
-# -------------------------------------------------------------
-# 4) Liens produits sur TOUTES les pages d'une collection
-#    max_pages: limite de pages
-#    max_products: limite de produits
-# -------------------------------------------------------------
-def extract_product_links_from_collection(
-    collection_url: str,
-    max_pages: int | None = None,
-    max_products: int | None = None,
-) -> list[str]:
-
-    all_links = []
-    seen = set()
-    page = 1
-
-    while True:
-        if max_pages is not None and page > max_pages:
-            break
-
-        page_url = build_collection_page_url(collection_url, page)
-        print(f"→ Page {page} : {page_url}")
-
-        links = extract_product_links_from_single_page(page_url)
-        print(f"   {len(links)} produits trouvés sur cette page")
-
-        if not links:
-            # plus de produits -> on arrête la pagination
-            break
-
-        new_links = [url for url in links if url not in seen]
-        seen.update(new_links)
-        all_links.extend(new_links)
-
-        if max_products is not None and len(all_links) >= max_products:
-            all_links = all_links[:max_products]
-            break
-
-        page += 1
-
-    print(f"Total produits uniques pour cette collection : {len(all_links)}")
-    return all_links
-
+            lower_href = href.lower()
+            if "men" in lower_href and "women" not in lower_href:
+                collections["Men"].add(full_url)
+            elif "women" in lower_href:
+                collections["Women"].add(full_url)
+            else:
+                collections["Uncategorized"].add(full_url)
+    
+    # Conversion en listes triées
+    return {k: sorted(list(v)) for k, v in collections.items()}
 
 # -------------------------------------------------------------
-# 5) Scraper une page produit TWOTHIRDS
-#    -> name, price, product_category_slug, gender, details
+# 2) Gestion de la pagination (Universelle Shopify)
 # -------------------------------------------------------------
-def scrape_twothirds_product(url: str, gender: str) -> dict:
+def build_next_page_url(collection_url: str, page_num: int) -> str:
+    parsed = urlparse(collection_url)
+    query = parse_qs(parsed.query)
+    query["page"] = [str(page_num)]
+    new_query = urlencode(query, doseq=True)
+    return parsed._replace(query=new_query).geturl()
+
+def get_product_links_from_page(url: str) -> list[str]:
+    """Extrait tous les liens contenant '/products/' sur une page."""
     soup = get_soup(url)
+    if not soup:
+        return []
+    
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/products/" in href:
+            # Nettoyage d'URL pour éviter les doublons type /collections/xyz/products/abc
+            # On veut juste https://site.com/products/abc
+            if "collections" in href:
+                # On essaie d'extraire la partie /products/...
+                parts = href.split("/products/")
+                if len(parts) > 1:
+                    clean_href = "/products/" + parts[1]
+                    links.add(urljoin(BASE_URL, clean_href))
+            else:
+                links.add(urljoin(BASE_URL, href))
+    return list(links)
 
-    # ----- Nom produit -----
-    name_tag = soup.find("h1")
-    name = name_tag.get_text(strip=True) if name_tag else "N/A"
+# -------------------------------------------------------------
+# 3) Extraction UNIVERSELLE (Via Meta Tags)
+# -------------------------------------------------------------
+def scrape_generic_product(url: str, category_context: str, gender_context: str) -> dict:
+    soup = get_soup(url)
+    if not soup:
+        return {}
 
-    # ----- Prix -----
-    price = None
-    for t in soup.find_all(string=True):
-        txt = t.strip()
-        if txt.startswith("€") and any(ch.isdigit() for ch in txt):
-            price = txt
-            break
-    if price is None:
-        price = "N/A"
+    # --- A. Extraction via Meta Tags (Le plus fiable pour tous les sites) ---
+    def get_meta(property_name):
+        tag = soup.find("meta", property=property_name) or soup.find("meta", attrs={"name": property_name})
+        return tag["content"].strip() if tag and tag.get("content") else None
 
-    # ----- Catégorie de produit depuis l'URL (slug entre /collections/ et /products/)
-    parsed = urlparse(url)
-    segments = parsed.path.strip("/").split("/")  # ['collections','t-shirts-men','products','...']
+    name = get_meta("og:title")
+    description = get_meta("og:description")
+    
+    # Prix : souvent dans og:price:amount ou product:price:amount
+    price = get_meta("og:price:amount") or get_meta("product:price:amount")
+    currency = get_meta("og:price:currency") or get_meta("product:price:currency") or "€"
 
-    product_category_slug = "N/A"
-    if "collections" in segments and "products" in segments:
-        idx_coll = segments.index("collections")
-        idx_prod = segments.index("products")
-        if idx_coll + 1 < idx_prod:
-            product_category_slug = segments[idx_coll + 1]
+    # Image URL
+    image_url = get_meta("og:image")
 
-    # ----- Bloc de description principal -----
-    def has_details_class(tag):
-        classes = tag.get("class", [])
-        return tag.name in {"div", "section"} and "HighlightSol--buildingBlock" in classes
+    # --- B. Fallback (Si les meta tags manquent) ---
+    if not name:
+        h1 = soup.find("h1")
+        name = h1.get_text(strip=True) if h1 else "Inconnu"
 
-    block = soup.find(has_details_class)
-    details = ""
+    if not price:
+        # Regex pour trouver un prix dans le texte visible (ex: 29.90 €)
+        # Cherche un motif chiffre + symbole monétaire ou l'inverse
+        text_body = soup.get_text()
+        found_price = re.search(r'(\d+[.,]\d{2})\s?€|€\s?(\d+[.,]\d{2})', text_body)
+        if found_price:
+            price = found_price.group(0) # Prend toute la chaîne trouvée
+        else:
+            price = "N/A"
 
-    if block:
-        paragraphs = [p.get_text(" ", strip=True) for p in block.find_all("p")]
-        list_items = [li.get_text(" ", strip=True) for li in block.find_all("li")]
+    if not description:
+        # Cherche la description standard Shopify
+        desc_div = soup.find(class_="product-description") or soup.find(class_="rte") or soup.find(id="description")
+        description = desc_div.get_text(" ", strip=True) if desc_div else "Pas de description détectée"
 
-        model_note = None
-        em = block.find("em")
-        if em:
-            model_note = em.get_text(" ", strip=True)
-
-        parts = paragraphs + list_items
-        if model_note:
-            parts.append(model_note)
-
-        details = " ".join(parts).strip()
-
-    # ----- Fallback si description vide : section "Details" -> avant "Delivery" -----
-    if not details:
-        details_heading = soup.find(
-            string=lambda t: isinstance(t, str) and t.strip() == "Details"
-        )
-        if details_heading:
-            parent = details_heading.find_parent()
-            texts = []
-            for sib in parent.next_siblings:
-                if getattr(sib, "get_text", None):
-                    t = sib.get_text(" ", strip=True)
-                    if t.startswith("Delivery"):
-                        break
-                    if t:
-                        texts.append(t)
-            details = " ".join(texts).strip()
-
-    if not details:
-        print(f"⚠️ Aucune description trouvée pour : {url}")
+    # Nettoyage final
+    # Si le nom contient " - SiteName", on l'enlève
+    site_name = urlparse(BASE_URL).netloc.replace("www.", "").split(".")[0]
+    if name and site_name.lower() in name.lower():
+        name = name.split("|")[0].strip()
 
     return {
         "name": name,
-        "price": price,
-        "product_category_slug": product_category_slug,
-        "gender": gender,
-        "details": details,
+        "price": f"{price} {currency}" if price and "€" not in str(price) and currency else price,
+        "category": category_context,
+        "gender": gender_context,
+        "description": description[:300] + "..." if description else "", # On tronque pour lisibilité
+        "image_url": image_url,
+        "product_url": url
     }
 
+# -------------------------------------------------------------
+# 4) Logique principale de boucle
+# -------------------------------------------------------------
+def process_category(category_url: str, gender: str, existing_urls: set):
+    """
+    Parcourt les pages d'une catégorie jusqu'à atteindre les limites de l'utilisateur.
+    """
+    collected_products = []
+    
+    # Extraction du nom de la catégorie depuis l'URL (pour le CSV)
+    path_parts = urlparse(category_url).path.strip("/").split("/")
+    cat_name = path_parts[-1] if path_parts else "general"
+
+    page = 1
+    total_scraped_in_cat = 0
+
+    print(f"\n📂 Traitement : {cat_name} ({gender})")
+
+    while True:
+        # 1. Vérif limite pages
+        if MAX_PAGES_TO_SCAN and page > MAX_PAGES_TO_SCAN:
+            break
+        
+        # 2. Construction URL et récupération liens
+        current_page_url = build_next_page_url(category_url, page)
+        print(f"   📄 Page {page}...")
+        
+        links = get_product_links_from_page(current_page_url)
+        if not links:
+            break # Plus de produits ou page vide
+
+        # 3. Scraping des produits
+        for link in links:
+            # Vérif limite produits par catégorie
+            if MAX_PRODUCTS_PER_CATEGORY and total_scraped_in_cat >= MAX_PRODUCTS_PER_CATEGORY:
+                return collected_products # On arrête tout pour cette catégorie
+
+            # On évite de scraper 2 fois la même URL (économie de temps)
+            if link in existing_urls:
+                continue
+            
+            existing_urls.add(link)
+            
+            # Action !
+            data = scrape_generic_product(link, cat_name, gender)
+            if data.get("name"):
+                collected_products.append(data)
+                total_scraped_in_cat += 1
+                print(f"      ✅ {data['name'][:30]}... ({data['price']})")
+                time.sleep(0.2) # Petite pause politesse
+            
+        page += 1
+    
+    return collected_products
 
 # -------------------------------------------------------------
-# 6) Scraper toutes les collections d'un genre (Men / Women)
-#    et renvoyer une liste de lignes (dict)
-# -------------------------------------------------------------
-def scrape_gender_collections(
-    gender: str,
-    collection_urls: list[str],
-    max_products_per_collection: int | None = None,
-    max_pages_per_collection: int | None = None,
-) -> list[dict]:
-    rows = []
-
-    for coll_url in collection_urls:
-        print(f"\n=== {gender} – Collection : {coll_url} ===")
-        product_urls = extract_product_links_from_collection(
-            coll_url,
-            max_pages=max_pages_per_collection,
-            max_products=max_products_per_collection,
-        )
-
-        for url in product_urls:
-            print(f"Scraping produit : {url}")
-            try:
-                data = scrape_twothirds_product(url, gender=gender)
-                rows.append(data)
-            except Exception as e:
-                print(f"Erreur sur {url} : {e}")
-
-    return rows
-
-
-# -------------------------------------------------------------
-# 7) MAIN : Men + Women → un seul CSV
+# 5) MAIN
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    MEN_COLLECTION_URLS = [
-        "https://twothirds.com/collections/t-shirts-men",     # T-Shirts
-        "https://twothirds.com/collections/trousers-men",     # Pants
-        "https://twothirds.com/collections/knits-men",        # Knits
-        "https://twothirds.com/collections/jackets-men",      # Jackets
-        "https://twothirds.com/collections/shirts-men",       # Shirts
-        "https://twothirds.com/collections/sweatshirts-men",  # Sweatshirts
-        "https://twothirds.com/collections/men-underwear",    # Underwear
-    ]
+    
+    # 1. Découverte des catégories
+    cats = discover_collections(BASE_URL)
+    
+    all_data = []
+    seen_urls = set() # Pour éviter les doublons globaux
 
-    WOMEN_COLLECTION_URLS = [
-        "https://twothirds.com/collections/tops",             # Tops
-        "https://twothirds.com/collections/shirts-women",     # Shirts
-        "https://twothirds.com/collections/trousers-women",   # Pants
-        "https://twothirds.com/collections/sweatshirts-women",# Sweatshirts
-        "https://twothirds.com/collections/knits-women",      # Knits
-        "https://twothirds.com/collections/jackets-women",    # Jackets
-        "https://twothirds.com/collections/skirts",           # Skirts
-        "https://twothirds.com/collections/women-loungewear", # Loungewear
-        "https://twothirds.com/collections/underwear",        # Underwear
-        "https://twothirds.com/collections/women-activewear", # Activewear
-        "https://twothirds.com/collections/swimwear-women",   # Swimwear
-    ]
+    # Liste des genres à traiter
+    target_groups = ["Men", "Women"] 
+    # Si le site n'a pas men/women dans les URLs, tout sera dans "Uncategorized", on l'ajoute :
+    if not cats["Men"] and not cats["Women"]:
+        target_groups.append("Uncategorized")
 
-    CSV_FILENAME = "twothirds_men_women_allcategories.csv"
+    # 2. Lancement du scraping
+    for group in target_groups:
+        urls = cats.get(group, [])
+        if not urls: continue
+        
+        print(f"\n--- Démarrage Groupe : {group} ({len(urls)} collections) ---")
+        
+        for coll_url in urls:
+            products = process_category(coll_url, group, seen_urls)
+            all_data.extend(products)
 
-    # Paramètres de contrôle :
-    #   max_products_per_collection=None -> tous les produits
-    #   max_pages_per_collection=None    -> toutes les pages de chaque collection
-    max_products_per_collection = None
-    max_pages_per_collection = None
-
-    rows_men = scrape_gender_collections(
-        "Men",
-        MEN_COLLECTION_URLS,
-        max_products_per_collection=max_products_per_collection,
-        max_pages_per_collection=max_pages_per_collection,
-    )
-
-    rows_women = scrape_gender_collections(
-        "Women",
-        WOMEN_COLLECTION_URLS,
-        max_products_per_collection=max_products_per_collection,
-        max_pages_per_collection=max_pages_per_collection,
-    )
-
-    all_rows = rows_men + rows_women
-
-    fieldnames = ["name", "price", "product_category_slug", "gender", "details"]
-
-    with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_rows)
-
-    print(f"\nCSV créé : {CSV_FILENAME} — {len(all_rows)} produits enregistrés.")
+    # 3. Sauvegarde
+    if all_data:
+        keys = ["name", "price", "category", "gender", "description", "image_url", "product_url"]
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(all_data)
+        print(f"\n✨ Terminé ! {len(all_data)} produits sauvegardés dans '{OUTPUT_CSV}'.")
+    else:
+        print("\n⚠️ Aucun produit trouvé. Vérifiez l'URL ou la structure du site.")
